@@ -194,8 +194,8 @@ class Constraint():
         if hcp_constraint is not None: self.hcp_constraint = hcp_constraint
         elif len(kwargs) > 0: self.hcp_constraint = HCPConstraint(**kwargs)
         else: self.hcp_constraint = None
-        self.no_shape_cond = shape_constraint is None or shape_constraint.no_shape_cond
-        self.no_hcp_cond = hcp_constraint is None or hcp_constraint.no_hcp_cond
+        self.no_shape_cond = self.shape_constraint is None or self.shape_constraint.no_shape_cond
+        self.no_hcp_cond = self.hcp_constraint is None or self.hcp_constraint.no_hcp_cond
         self.permute_suits = self.shape_constraint.permute_suits if self.shape_constraint is not None else SuitPermuter()
 
     def _parse_string(self):
@@ -327,8 +327,29 @@ class Dealer():
         print(f'Dealt {n} hands in {end-start:.2f} seconds ({n/(end-start):.2f} hands/second).')
         return deals
 
+class Simulator():
+    def __init__(self, constraint = None, given = None, **kwargs):
+        self.dealer = Dealer(constraint, given, **kwargs)
+        self.deals = []
+        self.n_deals = 0
+
+    def deal(self, n:int = 50000):
+        self.deals = self.dealer.deal(n)
+        self.n_deals = n
+        return self
+
+    def check(self, constraint):
+        passed = [constraint.check(deal) for deal in self.deals]
+        print(f'{sum(passed)}/{self.n_deals}({sum(passed)/self.n_deals:.2f}) deals passed the constraint check.')
+        return sum(passed)/self.n_deals
+
+    def expectation(self):
+        return np.mean([deal.array_rep for deal in self.deals], axis=0)
+
+
+# Example usage
 test = Constraint(
     SingleHandShapeConstraint(0, 5, 2, False), 
     HCPConstraint([13,37,37,37],[10,0,0,0]))
-dealer = Dealer(constraint = test)
-deals = dealer.deal(50000)
+dealer = Simulator(constraint = test).deal(50000)
+dealer.check(Constraint(None,HCPConstraint([37,37,37,37],[0,15,0,0])))
