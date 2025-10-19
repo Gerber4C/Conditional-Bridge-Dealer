@@ -505,14 +505,21 @@ class Dealer():
             hand.array_rep[constraint.hand, suit, chosen_cards] = True
 
         # then satisfy max shape constraints by dealing cards to other three hands
+        # hence, only the first n_avail_to_restricted_hand cards in each suit are eligible to be dealt to the constrained hand
+        avail_to_restricted_hand = []
         for suit in range(4):
             if constraint.suit_max[suit] == 13: continue
             available_cards = np.where(~hand.array_rep[:,suit,:].any(axis=0))[0]
             self.rng.shuffle(available_cards)
-            cards_to_deal = len(available_cards) - constraint.suit_max[suit] + hand.array_rep[constraint.hand, suit,:].sum()
-            for i in range(cards_to_deal):
-                weights = 13 - hand.array_rep.sum(axis = (1,2)); weights[constraint.hand] = 0
-                hand.array_rep[self.rng.choice(4, p = weights / weights.sum()), suit, available_cards[i]] = True
+            n_avail_to_restricted_hand = constraint.suit_max[suit] - hand.array_rep[constraint.hand, suit,:].sum()
+            avail_to_restricted_hand.append(np.stack((np.ones(n_avail_to_restricted_hand)*suit, 
+                                                      available_cards[:n_avail_to_restricted_hand])).T)
+        
+        # fill the constrained hand to 13 cards
+        avail_to_restricted_hand = np.concatenate(avail_to_restricted_hand, axis=0)
+        self.rng.shuffle(avail_to_restricted_hand)
+        for card in avail_to_restricted_hand[:13 - hand.array_rep[constraint.hand,:,:].sum()]:
+            hand.array_rep[constraint.hand, card[0], card[1]] = True
 
         # then deal all remaining cards
         hand = self._random(hand)
