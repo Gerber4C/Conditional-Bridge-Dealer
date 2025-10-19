@@ -1,8 +1,10 @@
 from time import perf_counter
 from tqdm import tqdm
 import numpy as np
+import pandas as pd
 import scipy.special as sp
 import types
+import re
 
 def map_id_to_card(id:int): return (id // 13, id % 13) # returns (suit, rank)
 
@@ -27,6 +29,8 @@ class Hand():
         self.hcp = self._get_hcp() # axes 0 = player
         self.pbn = ''
 
+    def __str__(self): return self._get_str()
+
     def _dealt(self):
         return self.array_rep.sum() == 52
 
@@ -49,6 +53,26 @@ class Hand():
         self.pbn = '"N:'+' '.join(pbn)+'"'
         return self.pbn
     
+    def _get_str(self):
+        suit_filter = np.array(['S','H','D','C'])
+        card_filter = np.array(['A','K','Q','J','T','9','8','7','6','5','4','3','2'])
+        out = []
+        # north hand
+        for i in range(4):
+            out.append(' '*9+ suit_filter[i]+' '+(''.join(card_filter[self.array_rep[0,i,:]])).ljust(23))
+        
+        # EW hands
+        for i in range(4):
+            out.append(
+                suit_filter[i] + ' ' + (''.join(card_filter[self.array_rep[3,i,:]])).ljust(15) +
+                suit_filter[i] + ' ' + (''.join(card_filter[self.array_rep[1,i,:]])).ljust(15)
+            )
+        
+        # south hand
+        for i in range(4):
+            out.append(' '*9+ suit_filter[i]+' '+(''.join(card_filter[self.array_rep[2,i,:]])).ljust(23))
+        return '\n'.join(out)
+    
     def _dealcard(self, hand:int, suit:int, rank:int):
         if self.fixed[suit, rank]: raise ValueError('Cannot deal a fixed card.')
         if self.array_rep[hand, suit, rank]: raise ValueError('Card already dealt to this hand.')
@@ -56,7 +80,7 @@ class Hand():
         self.shape = self._get_shape()
 
     def _to_deal(self): return ~self.array_rep.any(axis=0)
-    
+
     def reset(self): self.array_rep[:, ~self.fixed] = False
 
     def copy(self): return Hand(given = self.array_rep.copy())
@@ -76,6 +100,10 @@ class SuitPermuter():
         if self.c: permutable.append(3)
         self.permutable = permutable
     
+    def __eq__(self, other):
+        if not isinstance(other, SuitPermuter): return False
+        return (self.permutable == other.permutable)
+
     def permute(self, hand: Hand):
         perm = np.arange(4)
         np.random.shuffle(perm[self.permutable])
@@ -104,6 +132,12 @@ class HCPConstraint():
         # flag for quicker dealing
         self.no_hcp_cond = (hcp_max >= 37).all() and (hcp_min == 0).all()
     
+    def __str__(self):
+        return 'HCP Constraint:\n' + \
+            '    North East  South West\n' + \
+            'Max '+ ' '.join([str(x).ljust(5) for x in self.hcp_max]) + '\n' + \
+            'Min '+ ' '.join([str(x).ljust(5) for x in self.hcp_min])
+
     def copy(self):
         return HCPConstraint(self.hcp_max.copy(), self.hcp_min.copy())
 
@@ -112,9 +146,50 @@ class HCPConstraint():
         _ = hand._get_hcp() # forcibly updates the HCP attribute of the hand
         return all(hand.hcp <= self.hcp_max) and all(hand.hcp >= self.hcp_min)
 
+class SingleHandShapeConstraint():
+    def __init__(
+        self,
+        hand : int = 0, # 0 = North, 1 = East, 2 = South, 3 = West
+        suit_max:np.ndarray = np.repeat(13, 4),
+        suit_min:np.ndarray = np.zeros(4),
+        permute_suits = False, # True if you want to set longest suit etc.
+        **_ # additional params are ignored
+    ):
+        if isinstance(suit_max, (int, float)): suit_max = np.repeat(suit_max, 4).astype(int)
+        if isinstance(suit_min, (int, float)): suit_min = np.repeat(suit_min, 4).astype(int)
+        suit_max = np.array(suit_max); suit_min = np.array(suit_min)
+        # sense check
+        assert 0 <= hand <= 3, 'Hand must be an integer between 0 and 3.'
+        assert (13 >= suit_max).all() and (suit_max >= suit_min).all() and (suit_min >= 0).all(), \
+            '0 <= min cards <= max cards <= 13'
+        assert sum(suit_max) >= 13 and sum(suit_min) <= 13, 'Hands must be exactly 13 cards'
+        
+        self.hand = hand
+        self.suit_min = suit_min.astype(int); self.suit_max = suit_max.astype(int)
+        self.permute_suits = permute_suits if isinstance(permute_suits, SuitPermuter) else SuitPermuter(permute_suits)
+
+        # flag for quicker dealing
+        self.no_shape_cond = (suit_max == 13).all() and (suit_min == 0).all()
+
+    def __str__(self):
+        out = [f'Shape constraint for hand {["North","East","South","West"][self.hand]}:',
+               f'Max number of cards: S={self.suit_max[0]}, H={self.suit_max[1]}, D={self.suit_max[2]}, C={self.suit_max[3]}',
+               f'Min number of cards: S={self.suit_min[0]}, H={self.suit_min[1]}, D={self.suit_min[2]}, C={self.suit_min[3]}',
+               'Following suits can be exchanged:',
+               ', '.join(np.array(['S','H','D','C'])[self.permute_suits.permutable].tolist())]
+        return '\n'.join(out)
+
+    def copy(self):
+        return SingleHandShapeConstraint(self.hand, self.suit_max.copy(), self.suit_min.copy(), self.permute_suits)
+    
+    def check(self, hand: Hand):
+        if self.no_shape_cond: return True
+        _ = hand._get_shape() # forcibly updates the shape attribute of the hand
+        return (hand.shape[self.hand,:] <= self.suit_max).all() and (hand.shape[self.hand,:] >= self.suit_min).all()
+
 class ShapeConstraint():
     def __new__(
-        self,
+        cls,
         shape_max = np.ones((4,4))*13, # axis 0 = hand, axis 1 = suit
         shape_min = np.zeros((4,4)),
         permute_suits: SuitPermuter | bool = False, # True if you want to set longest suit etc.
@@ -142,15 +217,31 @@ class ShapeConstraint():
             return SingleHandShapeConstraint(
                 idx, shape_max[idx,:], shape_min[idx,:], permute_suits = permute_suits
             )
-        
+        return super().__new__(cls)
+    
+    def __init__(
+            self,
+            shape_max = np.ones((4,4))*13, # axis 0 = hand, axis 1 = suit
+            shape_min = np.zeros((4,4)),
+            permute_suits: SuitPermuter | bool = False, # True if you want to set longest suit etc.
+            **_ # additional params are ignored
+        ):
         self.shape_max = shape_max.astype(int)
         self.shape_min = shape_min.astype(int)
         self.permute_suits = SuitPermuter(permute_suits) if isinstance(permute_suits, bool) else permute_suits
 
         # flag for quicker dealing
         self.no_shape_cond = (self.shape_max == 13).all() and (self.shape_min == 0).all()
-        return self
-    
+
+    def __str__(self):
+        out = ['Shape constraint:', 'Max number of cards:',
+               pd.DataFrame(self.shape_max, columns=['S','H','D','C'], index=['N','E','S','W']).__str__(),
+               'Min number of cards:',
+               pd.DataFrame(self.shape_min, columns=['S','H','D','C'], index=['N','E','S','W']).__str__(),
+               'Following suits can be exchanged:',
+               ', '.join(np.array(['S','H','D','C'])[self.permute_suits.permutable].tolist())]
+        return '\n'.join(out)
+
     def copy(self):
         return ShapeConstraint(self.shape_max.copy(), self.shape_min.copy(), self.permute_suits)
 
@@ -159,39 +250,6 @@ class ShapeConstraint():
         _ = hand._get_shape() # forcibly updates the shape attribute of the hand
         return (hand.shape <= self.shape_max).all() and (hand.shape >= self.shape_min).all()
 
-class SingleHandShapeConstraint():
-    def __init__(
-        self,
-        hand : int = 0, # 0 = North, 1 = East, 2 = South, 3 = West
-        suit_max:np.ndarray = np.repeat(13, 4),
-        suit_min:np.ndarray = np.zeros(4),
-        permute_suits = False, # True if you want to set longest suit etc.
-        **_ # additional params are ignored
-    ):
-        if isinstance(suit_max, (int, float)): suit_max = np.repeat(suit_max, 4).astype(int)
-        if isinstance(suit_min, (int, float)): suit_min = np.repeat(suit_min, 4).astype(int)
-        suit_max = np.array(suit_max); suit_min = np.array(suit_min)
-        # sense check
-        assert 0 <= hand <= 3, 'Hand must be an integer between 0 and 3.'
-        assert (13 >= suit_max).all() and (suit_max >= suit_min).all() and (suit_min >= 0).all(), \
-            '0 <= min cards <= max cards <= 13'
-        assert sum(suit_max) >= 13 and sum(suit_min) <= 13, 'Hands must be exactly 13 cards'
-        
-        self.hand = hand
-        self.suit_min = suit_min.astype(int); self.suit_max = suit_max.astype(int)
-        self.permute_suits = permute_suits if isinstance(permute_suits, SuitPermuter) else SuitPermuter(permute_suits)
-
-        # flag for quicker dealing
-        self.no_shape_cond = (suit_max == 13).all() and (suit_min == 0).all()
-
-    def copy(self):
-        return SingleHandShapeConstraint(self.hand, self.suit_max.copy(), self.suit_min.copy(), self.permute_suits)
-    
-    def check(self, hand: Hand):
-        if self.no_shape_cond: return True
-        _ = hand._get_shape() # forcibly updates the shape attribute of the hand
-        return (hand.shape[self.hand,:] <= self.suit_max).all() and (hand.shape[self.hand,:] >= self.suit_min).all()
-    
 class Constraint():
     def __init__(
         self,
@@ -209,10 +267,8 @@ class Constraint():
         self.no_hcp_cond = self.hcp_constraint is None or self.hcp_constraint.no_hcp_cond
         self.permute_suits = self.shape_constraint.permute_suits if self.shape_constraint is not None else SuitPermuter()
 
-    def _parse_string(self):
-        # TODO
-        pass
-    
+    def __str__(self): return self.shape_constraint.__str__() + '\n\n' + self.hcp_constraint.__str__()
+
     def copy(self):
         return Constraint(
             self.shape_constraint.copy() if self.shape_constraint is not None else None,
@@ -223,7 +279,172 @@ class Constraint():
         if not self.no_shape_cond and not self.shape_constraint.check(hand): return False
         if not self.no_hcp_cond and not self.hcp_constraint.check(hand): return False
         return True
+
+def combine_single_hand_shape_constraints(*constraints: SingleHandShapeConstraint | types.NoneType):
+    shape_max = np.ones((4,4))*13; shape_min = np.zeros((4,4))
+    permute_suits = None
+    for constraint in constraints:
+        if constraint is None: continue
+        shape_max[constraint.hand,:] = constraint.suit_max
+        shape_min[constraint.hand,:] = constraint.suit_min
+        if constraint.permute_suits != permute_suits and permute_suits != None:
+            raise ValueError('Cannot combine SingleHandShapeConstraints with different permute_suits settings.')
+        else: permute_suits = constraint.permute_suits
+    return ShapeConstraint(shape_max, shape_min, permute_suits = permute_suits)
+
+def parse_string(constraint_string: str):
+    '''
+    Constraint string format:
+        north (conditions) east (conditions) south (conditions) west (conditions)
+        no spaces are allowed within each condition
+        following conditions are accepted:
+            5+S / 3-C / 3-5H : shape constraint for each suit
+            5332 / 5(3)3(2) / 5(332) : shape constraint for all suits, must add to 13; suits in brackets can be permuted
+                this constraint cannot be used for suits with 10+ cards
+            longest>=6 / second==4 / third<3 / shortest==0 : shape constraint for longest/second/third/shortest suits
+            --- above constraints are mutually exclusive ---
+            10+HCP / 10-13P / 3-P : HCP constraint
+            hascard SA 10D CT (...) : given cards (accepts both 10 and T)
+    everything can be upper or lower case
+    '''
+    constraint_string = constraint_string.lower().split()
+
+    # first separate conditions to each hand
+    hand_conditions = {'north':[], 'east':[], 'south':[], 'west':[]}
+    current_hand = ''
+    for token in constraint_string:
+        if token in hand_conditions.keys(): current_hand = token
+        elif current_hand == '': raise ValueError('Constraint string must start with a hand name (north/east/south/west).')
+        else: hand_conditions[current_hand].append(token)
     
+    def classify_consition(token:str):
+        if re.match(r'^\d{1,2}[\+\-]\d{0,2}[shdc]$', token): return 'shape_suit'
+        elif re.match(r'^[0-9()]*$', token): return 'shape_all'
+        elif re.match(r'^(longest|second|third|shortest)([<>=])(={0,1})(\d{1,2})$', token): return 'shape_ranked'
+        elif re.match(r'^\d{1,2}[\+\-]\d{0,2}(hcp|p)$', token): return 'hcp'
+        else: raise ValueError(f'Unrecognized constraint token: {token}; given cards must follow the "hascard" keyword.')
+
+    def parse_shape_suit(*tokens:str):
+        suit_map = {'s':0, 'h':1, 'd':2, 'c':3}
+        shape_max = np.ones(4)*13; shape_min = np.zeros(4)
+        for token in tokens:
+            match = re.match(r'^(\d{1,2})([\+\-])(\d{0,2})([shdc])$', token)
+            number = int(match.group(1))
+            operator = match.group(2)
+            limit = match.group(3)
+            suit = suit_map[match.group(4)]
+            if operator == '+':
+                shape_min[suit] = max(shape_min[suit], number)
+            elif operator == '-':
+                if limit == '': shape_max[suit] = min(shape_max[suit], number)
+                else: shape_min[suit] = max(shape_min[suit], number); shape_max[suit] = min(shape_max[suit], int(limit))
+        return shape_max, shape_min, SuitPermuter(False)
+    
+    def parse_shape_all(token:str):
+        permute_suits = []
+        suit_lengths = []
+        in_bracket = False
+        for char in token:
+            if char == '(': in_bracket = True; continue
+            if char == ')': in_bracket = False; continue
+            if char.isdigit():
+                suit_lengths.append(int(char))
+                permute_suits.append(in_bracket)
+        shape_max = np.array(suit_lengths).astype(int); shape_min = np.array(suit_lengths).astype(int)
+        assert shape_max.sum() == 13, 'Total cards in shape constraint must sum to 13.'
+        return shape_max, shape_min, SuitPermuter(permute_suits)
+
+    def parse_shape_ranked(*tokens:str):
+        shape_max = np.ones(4)*13; shape_min = np.zeros(4)
+        rank_map = {'longest':0, 'second':1, 'third':2, 'shortest':3}
+        for token in tokens:
+            match = re.match(r'^(longest|second|third|shortest)([<>=])(={0,1})(\d{1,2})$', token)
+            rank = rank_map[match.group(1)]
+            operator = match.group(2)
+            equal_sign = match.group(3)
+            number = int(match.group(4))
+            if operator == '>':
+                shape_min[rank] = np.maximum(shape_min[rank], number + (1 if equal_sign == '=' else 0))
+            elif operator == '<':
+                shape_max[rank] = np.minimum(shape_max[rank], number - (1 if equal_sign == '=' else 0))
+            elif operator == '=':
+                shape_min[rank] = np.maximum(shape_min[rank], number)
+                shape_max[rank] = np.minimum(shape_max[rank], number)
+        return shape_max, shape_min, SuitPermuter(True)
+    
+    def parse_hcp(token:str, hand: int, current_constraint: HCPConstraint | types.NoneType):
+        if current_constraint is None: current_constraint = HCPConstraint()
+        match = re.match(r'^(\d{1,2})([\+\-])(\d{0,2})(hcp|p)$', token)
+        number = int(match.group(1))
+        operator = match.group(2)
+        limit = match.group(3)
+        if operator == '+':
+            current_constraint.hcp_min[hand] = max(current_constraint.hcp_min[hand], number)
+        elif operator == '-':
+            if limit == '': current_constraint.hcp_max[hand] = min(current_constraint.hcp_max[hand], number)
+            else: 
+                current_constraint.hcp_min[hand] = max(current_constraint.hcp_min[hand], number)
+                current_constraint.hcp_max[hand] = min(current_constraint.hcp_max[hand], limit)
+        return current_constraint
+    
+    def parse_given_cards(hand: int, given_hand: Hand | types.NoneType , *tokens:str):
+        suit_map = {'s':0, 'h':1, 'd':2, 'c':3}
+        rank_map = {'a':0, 'k':1, 'q':2, 'j':3, 't':4, '9':5, '8':6, '7':7, '6':8, '5':9, '4':10, '3':11, '2':12, '10':4}
+        given_hand = Hand() if given_hand is None else given_hand
+        for token in tokens:
+            if match := re.match(r'^(s|h|d|c)(a|k|q|j|t|10|9|8|7|6|5|4|3|2)$', token):
+                suit = suit_map[match.group(1)]; rank = rank_map[match.group(2)]
+            elif match := re.match(r'^(a|k|q|j|t|10|9|8|7|6|5|4|3|2)(s|h|d|c)$', token):
+                suit = suit_map[match.group(2)]; rank = rank_map[match.group(1)]
+            else: raise ValueError(f'Unrecognized card token: {token}.')
+            given_hand._dealcard(hand, suit, rank)
+        return given_hand
+
+    # initialise constraints
+    shape_constraints = []
+    hcp_constraint = HCPConstraint()
+    given_hand = Hand()
+    for idx, constraits in enumerate(hand_conditions.values()):
+        shape_tokens = []
+        shape_type = None
+        hcp_tokens = []
+        given_tokens = []
+        i = 0
+        while i < len(constraits):
+            token = constraits[i]
+            if token == 'hascard':
+                given_tokens = constraits[i+1:]
+                break
+            token_type = classify_consition(token)
+            if token_type.startswith('shape'):
+                if shape_type is None: shape_type = token_type
+                elif shape_type != token_type:
+                    raise ValueError('Different types of shape constraints cannot be combined.')
+                shape_tokens.append(token)
+            elif token_type == 'hcp':
+                hcp_tokens.append(token)
+            i += 1
+        
+        # parse shape constraints
+        if shape_type == 'shape_suit':
+            s_max, s_min, permute_suits = parse_shape_suit(*shape_tokens)
+            shape_constraints.append(SingleHandShapeConstraint(idx, s_max, s_min, permute_suits))
+        elif shape_type == 'shape_all':
+            s_max, s_min, permute_suits = parse_shape_all(''.join(shape_tokens))
+            shape_constraints.append(SingleHandShapeConstraint(idx, s_max, s_min, permute_suits))
+        elif shape_type == 'shape_ranked':
+            s_max, s_min, permute_suits = parse_shape_ranked(*shape_tokens)
+            shape_constraints.append(SingleHandShapeConstraint(idx, s_max, s_min, permute_suits))
+        
+        # parse hcp constraints
+        for token in hcp_tokens:
+            hcp_constraint = parse_hcp(token, idx, hcp_constraint)
+        
+        # parse given cards
+        if len(given_tokens) > 0: given_hand = parse_given_cards(idx, given_hand, *given_tokens)
+    shape_constraint = combine_single_hand_shape_constraints(*shape_constraints) if len(shape_constraints) > 0 else None
+    return Constraint(shape_constraint, hcp_constraint), given_hand
+
 class Dealer():
     def __init__(
             self, 
@@ -311,21 +532,21 @@ class Dealer():
         assert (hand._get_shape() >= constraint.shape_min).all(), 'Need to satisfy min shape constraints first.'
         
         # need to ensure max shape constraints are voids
-        assert ((hand._get_shape() == constraint.shape_max) | (constraint.shape_max == hand._get_shape())).all(), \
+        assert ((hand._get_shape() == constraint.shape_max) | (constraint.shape_max == 13)).all(), \
             'Max shape constraints must be voids.'
         
         # deal cards in all suits with a void constraint first
         void_suits = np.where((hand._get_shape() == constraint.shape_max).any(axis = 0))
-        available_cards = np.stack(np.where(hand._to_deal()())).T # (suit, rank)
-        available_cards = available_cards[available_cards[:,0].isin(void_suits),:]
+        available_cards = np.stack(np.where(hand._to_deal())).T # (suit, rank)
+        available_cards = available_cards[np.isin(available_cards[:,0],void_suits),:]
         self.rng.shuffle(available_cards)
         for card in available_cards:
             weights_array = hand._to_deal()[np.newaxis,:,:].astype(int).repeat(4, axis=0)
             weights_array[hand._get_shape() == constraint.shape_max] = 0
             remaining_cards = hand._to_deal().sum(axis = 1) # empty slots in each hand
-            weights_array /= weights_array.sum(axis=(1,2), keepdims=True)
+            weights_array = weights_array / weights_array.sum(axis=(1,2), keepdims=True)
             weights_array *= remaining_cards[:,np.newaxis,np.newaxis]
-            hand.array_rep[self.rng.choice(4, p = weights_array[*card] / weights_array[*,card].sum()), card[0], card[1]] = True
+            hand.array_rep[self.rng.choice(4, p = weights_array[:,*card] / weights_array[:,*card].sum()), card[0], card[1]] = True
 
         # then deal all remaining suits
         return self._random(hand)
@@ -361,27 +582,42 @@ class Dealer():
 
         cards_by_suit = 13 - current_shape.sum(axis=0) # cards left to deal in each suit
         cards_by_hand = 13 - current_shape.sum(axis=1) # cards left to deal in each hand
+        constrain_4th_suit = np.ones(4)*13; constrain_4th_hand = np.ones(4)*13 # if 3 hands/suits are constrained, the 4th is fixed
         constrained_idx = np.stack(np.where((current_shape <= constraint.shape_max) & (constraint.shape_max != 13))).T # (hand, suit)
+        for s in np.unique(constrained_idx[:,1]):
+            suit_idx = np.where(constrained_idx[:,1] == s)[0] # indices of constraints in this suit
+            if len(suit_idx) == 4:
+                constrain_4th_hand[s] = constrained_idx[suit_idx[3],0]
+                constrained_idx = np.delete(constrained_idx, suit_idx[3], axis=0)
+        for h in np.unique(constrained_idx[:,0]):
+            hand_idx = np.where(constrained_idx[:,0] == h)[0]
+            if len(hand_idx) == 4:
+                constrain_4th_suit[h] = constrained_idx[hand_idx[3],1]
+                constrained_idx = np.delete(constrained_idx, hand_idx[3], axis=0)
         n_constraints = constrained_idx.shape[0]
         constrained_ranges = []
         weight_array = 1
         for axis, idx in enumerate(constrained_idx):
-            max_cards = constraint.shape_max[idx[0], idx[1]] - current_shape[idx[0], idx[1]]
-            reshape_axis = np.ones(n_constraints); reshape_axis[axis] = -1
+            max_cards = (constraint.shape_max[idx[0], idx[1]] - current_shape[idx[0], idx[1]]).astype(int)
+            reshape_axis = np.ones(n_constraints).astype(int); reshape_axis[axis] = -1
             card_range = np.arange(0, max_cards+1).reshape(reshape_axis)
             constrained_ranges.append(card_range)
-            weight_array *= sp.factorial(card_range)
-
-        for suit in np.unique(constrained_idx[:,1]):
-            suit_idx = np.where(constrained_ranges[:,1] == suit)[0]
-            weight_array *= sp.factorial( cards_by_suit[suit] - sum([constrained_ranges[i] for i in suit_idx]) ) # NB not np.sum
-
-        for hand in np.unique(constrained_idx[:,0]):
-            hand_idx = np.where(constrained_ranges[:,0] == hand)[0]
-            weight_array *= sp.factorial( cards_by_hand[hand] - sum([constrained_ranges[i] for i in hand_idx]) ) # NB not np.sum
+            weight_array = weight_array * sp.factorial(card_range)
+        
+        for s in np.unique(constrained_idx[:,1]):
+            suit_idx = np.where(constrained_idx[:,1] == s)[0] # indices of constraints in this suit
+            tmp = sum([constrained_ranges[i] for i in suit_idx])
+            tmp[tmp + constrain_4th_hand[s] < cards_by_suit[s]] = 13
+            weight_array = weight_array * sp.factorial( cards_by_suit[s] - tmp ) # ineligible hands are assigned weight 0
+        for h in np.unique(constrained_idx[:,0]):
+            hand_idx = np.where(constrained_idx[:,0] == h)[0]
+            tmp = sum([constrained_ranges[i] for i in hand_idx])
+            tmp[tmp + constrain_4th_suit[s] < cards_by_hand[h]] = 13
+            weight_array = weight_array * sp.factorial( cards_by_hand[h] - tmp ) # NB not np.sum
 
         weight_array[weight_array == 0] = np.inf # combinations that violate the 13-card total will be discarded
         weight_array **= -1
+        weight_array[np.isnan(weight_array)] = 0
         weight_array /= weight_array.sum()
         cards_to_deal = np.unravel_index(self.rng.choice(weight_array.size, p = weight_array.flatten()), weight_array.shape)
 
@@ -398,6 +634,8 @@ class Dealer():
 
         # then deal all remaining cards using void constraints
         new_constraint = constraint.copy()
+        new_constraint.shape_max[3,constrain_4th_hand != 13] = 13
+        new_constraint.shape_max[constrain_4th_suit != 13,3] = 13
         new_shape = hand._get_shape()
         for idx in constrained_idx:
             new_constraint.shape_max[idx[0], idx[1]] = new_shape[idx[0], idx[1]] 
@@ -524,8 +762,26 @@ class Simulator():
 
 
 # Example usage
-test = Constraint(
-    SingleHandShapeConstraint(0, 5, 2, False), 
-    HCPConstraint([13,37,37,37],[10,0,0,0]))
-dealer = Simulator(constraint = test).deal(50000)
+test = Constraint(SingleHandShapeConstraint(0, 5, 2, False), HCPConstraint([13,37,37,37],[10,0,0,0])) # 1NT
+test = Constraint()
+# test = Constraint(ShapeConstraint(
+#     shape_max = np.array([[5, 5, 5, 5],
+#                           [5, 5, 13, 13],
+#                           [5, 5, 13, 13],
+#                           [5, 13, 13, 13]]),
+#     shape_min = np.array([[0, 0, 0, 0],
+#                           [0, 0, 0, 0],
+#                           [0, 0, 0, 0],
+#                           [0, 0, 0, 0]]),
+#     permute_suits = False
+# ), HCPConstraint([37,37,37,37],[0,0,0,0]))
+# test = Constraint(ShapeConstraint(
+#     shape_max = np.ones((4,4)) * 5,
+#     shape_min = np.array([[0, 0, 0, 0],
+#                           [0, 0, 0, 0],
+#                           [0, 0, 0, 0],
+#                           [0, 0, 0, 0]]),
+#     permute_suits = False
+# ), HCPConstraint([37,37,37,37],[0,0,0,0]))
+dealer = Simulator(constraint = test).deal(5000)
 dealer.check(Constraint(None,HCPConstraint([37,37,37,37],[0,15,0,0])))
