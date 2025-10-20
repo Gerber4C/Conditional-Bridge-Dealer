@@ -87,7 +87,11 @@ class Hand():
 
 class SuitPermuter():
     def __init__(self, overall = False, **kwargs):
-        self.s = overall; self.h = overall; self.d = overall; self.c = overall
+        if isinstance(overall, bool):
+            self.s = overall; self.h = overall; self.d = overall; self.c = overall
+        elif len(overall) == 4:
+            self.s = overall[0]; self.h = overall[1]; self.d = overall[2]; self.c = overall[3]
+        else: raise ValueError('Overall parameter should be an array of length 4 or boolean')
         for k,v in kwargs.items():
             if k not in ['s','h','d','c']: continue
             if not isinstance(v, bool): raise ValueError(f'SuitPermuter argument {k} must be a boolean.')
@@ -99,6 +103,12 @@ class SuitPermuter():
         if self.d: permutable.append(2)
         if self.c: permutable.append(3)
         self.permutable = permutable
+    
+    def __str__(self):
+        if any(self.permutable):
+            return 'Following suits can be exchanged:' + \
+                ', '.join(np.array(['S','H','D','C'])[self.permute_suits.permutable].tolist())
+        else: return 'All suits are as given and not exchangeable.'
     
     def __eq__(self, other):
         if not isinstance(other, SuitPermuter): return False
@@ -175,8 +185,7 @@ class SingleHandShapeConstraint():
         out = [f'Shape constraint for hand {["North","East","South","West"][self.hand]}:',
                f'Max number of cards: S={self.suit_max[0]}, H={self.suit_max[1]}, D={self.suit_max[2]}, C={self.suit_max[3]}',
                f'Min number of cards: S={self.suit_min[0]}, H={self.suit_min[1]}, D={self.suit_min[2]}, C={self.suit_min[3]}',
-               'Following suits can be exchanged:',
-               ', '.join(np.array(['S','H','D','C'])[self.permute_suits.permutable].tolist())]
+               self.permute_suits.__str__()]
         return '\n'.join(out)
 
     def copy(self):
@@ -384,7 +393,7 @@ def parse_string(constraint_string: str):
             if limit == '': current_constraint.hcp_max[hand] = min(current_constraint.hcp_max[hand], number)
             else: 
                 current_constraint.hcp_min[hand] = max(current_constraint.hcp_min[hand], number)
-                current_constraint.hcp_max[hand] = min(current_constraint.hcp_max[hand], limit)
+                current_constraint.hcp_max[hand] = min(current_constraint.hcp_max[hand], int(limit))
         return current_constraint
     
     def parse_given_cards(hand: int, given_hand: Hand | types.NoneType , *tokens:str):
@@ -516,9 +525,10 @@ class Dealer():
                                                       available_cards[:n_avail_to_restricted_hand])).T)
         
         # fill the constrained hand to 13 cards
-        avail_to_restricted_hand = np.concatenate(avail_to_restricted_hand, axis=0)
+        avail_to_restricted_hand = np.concatenate(avail_to_restricted_hand, axis=0).astype(int)
         self.rng.shuffle(avail_to_restricted_hand)
-        for card in avail_to_restricted_hand[:13 - hand.array_rep[constraint.hand,:,:].sum()]:
+        n_to_restricted_hand = int(13 - hand.array_rep[constraint.hand,:,:].sum())
+        for card in avail_to_restricted_hand[:n_to_restricted_hand]:
             hand.array_rep[constraint.hand, card[0], card[1]] = True
 
         # then deal all remaining cards
@@ -769,6 +779,7 @@ class Simulator():
 
 
 # Example usage
+a = parse_string('north 4441 13-18P south 3+S 4+H 14+HCP hascard HA')
 test = Constraint(SingleHandShapeConstraint(0, 5, 2, False), HCPConstraint([13,37,37,37],[10,0,0,0])) # 1NT
 test = Constraint()
 # test = Constraint(ShapeConstraint(
